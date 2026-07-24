@@ -2,12 +2,62 @@ import streamlit as st
 import folium
 from folium.plugins import Geocoder
 from streamlit_folium import st_folium
+from branca.element import MacroElement
+from jinja2 import Template
 import requests
 import pandas as pd
 import numpy as np
 import io
 
 st.set_page_config(page_title="NSRDB Downloader", layout="centered")
+
+
+class CoordinateSearch(MacroElement):
+    """Lets the map's search bar accept raw "lat, lon" input.
+
+    The search bar only geocodes place names via Nominatim, so pasting
+    coordinates into it normally returns nothing. This intercepts Enter on
+    that input and, if it looks like a coordinate pair, fires a synthetic
+    map click at that point instead - the same path a real click takes,
+    so it flows through streamlit_folium's existing last_clicked handling.
+
+    Must be added as a child of the map (map.add_child(...)) rather than
+    injected via get_root().html.add_child(...): streamlit_folium only
+    executes the map's "script" content, not raw html/script children,
+    which are inserted via innerHTML and never actually run.
+    """
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function() {
+            var coordPattern = /^\\s*(-?\\d+(?:\\.\\d+)?)\\s*[,\\s]\\s*(-?\\d+(?:\\.\\d+)?)\\s*$/;
+            var tries = 0;
+            var interval = setInterval(function() {
+                tries++;
+                var input = document.querySelector('.leaflet-control-geocoder-form input');
+                if (input) {
+                    clearInterval(interval);
+                    input.addEventListener('keydown', function(e) {
+                        if (e.key !== 'Enter') return;
+                        var match = input.value.match(coordPattern);
+                        if (!match) return;
+                        e.preventDefault();
+                        e.stopImmediatePropagation();
+                        var lat = parseFloat(match[1]);
+                        var lon = parseFloat(match[2]);
+                        var map = {{ this._parent.get_name() }};
+                        map.setView([lat, lon], map.getZoom());
+                        map.fire('click', {latlng: L.latLng(lat, lon)});
+                    }, true);
+                } else if (tries > 40) {
+                    clearInterval(interval);
+                }
+            }, 250);
+        })();
+        {% endmacro %}
+        """
+    )
 
 # Output column order/names, matching the reference export layout
 OUTPUT_COLUMNS = ["Day", "Time", "GHI", "DNI", "DIF", "TEMP", "WS", "WD", "RH", "AP", "PWAT"]
@@ -92,6 +142,8 @@ m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start
 Geocoder().add_to(m)
 # Add a marker for the current selection
 folium.Marker([st.session_state.lat, st.session_state.lon], tooltip="Current Selection").add_to(m)
+# Let the search bar above also accept raw "lat, lon" coordinate input
+m.add_child(CoordinateSearch())
 
 # Render the map in Streamlit (this catches map clicks automatically).
 # A stable key avoids remounting the map component on every rerun, and
@@ -105,7 +157,8 @@ map_data = st_folium(
     returned_objects=["last_clicked", "zoom"],
 )
 
-# Update coordinates if the user clicked the map
+# Update coordinates if the user clicked the map (or pasted coordinates into
+# the search bar, which is wired to fire a synthetic click - see CoordinateSearch)
 if map_data and map_data.get("last_clicked"):
     st.session_state.lat = map_data["last_clicked"]["lat"]
     st.session_state.lon = map_data["last_clicked"]["lng"]
