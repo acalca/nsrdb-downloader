@@ -1,63 +1,122 @@
 import streamlit as st
-import folium
-from folium.plugins import Geocoder
-from streamlit_folium import st_folium
-from branca.element import MacroElement
-from jinja2 import Template
+from streamlit_image_coordinates import streamlit_image_coordinates
+from PIL import Image, ImageDraw
 import requests
 import pandas as pd
 import numpy as np
+import math
 import io
 
 st.set_page_config(page_title="NSRDB Downloader", layout="centered")
 
+# --- Static map (no third-party JS map widget - see note in the Location
+# section below for why). Voyager is CARTO's colorful, Google-Maps-like
+# style (vs. the plainer "light_all"); @2x is the retina/high-DPI tile
+# variant for a crisper render. Still free, no API key needed, same
+# attribution terms as before.
+TILE_SIZE = 512
+TILE_URL = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png"
+MAP_WIDTH, MAP_HEIGHT = 700, 400
+MIN_ZOOM, MAX_ZOOM = 2, 17
 
-class CoordinateSearch(MacroElement):
-    """Lets the map's search bar accept raw "lat, lon" input.
 
-    The search bar only geocodes place names via Nominatim, so pasting
-    coordinates into it normally returns nothing. This intercepts Enter on
-    that input and, if it looks like a coordinate pair, fires a synthetic
-    map click at that point instead - the same path a real click takes,
-    so it flows through streamlit_folium's existing last_clicked handling.
+def lonlat_to_world_px(lon, lat, zoom):
+    """Web Mercator projection: geographic coords -> pixel coords in the full world map at this zoom."""
+    n = 2 ** zoom
+    x = (lon + 180.0) / 360.0 * n * TILE_SIZE
+    lat_rad = math.radians(max(min(lat, 85.05), -85.05))
+    y = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n * TILE_SIZE
+    return x, y
 
-    Must be added as a child of the map (map.add_child(...)) rather than
-    injected via get_root().html.add_child(...): streamlit_folium only
-    executes the map's "script" content, not raw html/script children,
-    which are inserted via innerHTML and never actually run.
-    """
 
-    _template = Template(
-        """
-        {% macro script(this, kwargs) %}
-        (function() {
-            var coordPattern = /^\\s*(-?\\d+(?:\\.\\d+)?)\\s*[,\\s]\\s*(-?\\d+(?:\\.\\d+)?)\\s*$/;
-            var tries = 0;
-            var interval = setInterval(function() {
-                tries++;
-                var input = document.querySelector('.leaflet-control-geocoder-form input');
-                if (input) {
-                    clearInterval(interval);
-                    input.addEventListener('keydown', function(e) {
-                        if (e.key !== 'Enter') return;
-                        var match = input.value.match(coordPattern);
-                        if (!match) return;
-                        e.preventDefault();
-                        e.stopImmediatePropagation();
-                        var lat = parseFloat(match[1]);
-                        var lon = parseFloat(match[2]);
-                        var map = {{ this._parent.get_name() }};
-                        map.setView([lat, lon], map.getZoom());
-                        map.fire('click', {latlng: L.latLng(lat, lon)});
-                    }, true);
-                } else if (tries > 40) {
-                    clearInterval(interval);
-                }
-            }, 250);
-        })();
-        {% endmacro %}
-        """
+def world_px_to_lonlat(x, y, zoom):
+    """Inverse of lonlat_to_world_px: pixel coords in the world map -> geographic coords."""
+    n = 2 ** zoom
+    lon = x / (n * TILE_SIZE) * 360.0 - 180.0
+    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * y / (n * TILE_SIZE))))
+    return math.degrees(lat_rad), lon
+
+
+@st.cache_data(show_spinner=False, max_entries=1000)
+def fetch_tile(zoom, x, y):
+    """Fetch and cache a single map tile image."""
+    n = 2 ** zoom
+    x = x % n  # wrap around the antimeridian
+    response = requests.get(
+        TILE_URL.format(z=zoom, x=x, y=y),
+        headers={"User-Agent": "nsrdb-downloader-streamlit-app"},
+        timeout=10,
     )
+    response.raise_for_status()
+    return Image.open(io.BytesIO(response.content)).convert("RGB")
+
+
+def render_map_image(center_lat, center_lon, zoom, width, height):
+    """Stitch tiles into a single image centered on (center_lat, center_lon), with a marker at the center."""
+    center_x, center_y = lonlat_to_world_px(center_lon, center_lat, zoom)
+    top_left_x = center_x - width / 2
+    top_left_y = center_y - height / 2
+    n = 2 ** zoom
+
+    canvas = Image.new("RGB", (width, height), color=(221, 221, 221))
+    first_tx, first_ty = int(top_left_x // TILE_SIZE), int(top_left_y // TILE_SIZE)
+    last_tx, last_ty = int((top_left_x + width) // TILE_SIZE), int((top_left_y + height) // TILE_SIZE)
+
+    for tx in range(first_tx, last_tx + 1):
+        for ty in range(first_ty, last_ty + 1):
+            if ty < 0 or ty >= n:
+                continue
+            try:
+                tile_img = fetch_tile(zoom, tx, ty)
+            except Exception:
+                continue
+            canvas.paste(tile_img, (int(tx * TILE_SIZE - top_left_x), int(ty * TILE_SIZE - top_left_y)))
+
+    draw = ImageDraw.Draw(canvas)
+    cx, cy = width // 2, height // 2
+    draw.ellipse([cx - 7, cy - 7, cx + 7, cy + 7], fill=(220, 30, 30), outline=(0, 0, 0), width=2)
+
+    return canvas
+
+
+DOUBLE_CLICK_MS = 500
+DOUBLE_CLICK_PIXEL_TOLERANCE = 6
+
+
+def _on_map_click():
+    """Convert the clicked pixel back to lat/lon, using the view that was active when it was rendered.
+
+    Also detects a double-click (two clicks close in time and position) and
+    treats it as "zoom in here", the conventional map gesture - there's no
+    mouse-wheel event available through this component.
+    """
+    click = st.session_state.location_map_img
+    if not click:
+        return
+
+    last_click = st.session_state.get("_last_map_click")
+    is_double_click = (
+        last_click is not None
+        and click["unix_time"] - last_click["unix_time"] <= DOUBLE_CLICK_MS
+        and abs(click["x"] - last_click["x"]) <= DOUBLE_CLICK_PIXEL_TOLERANCE
+        and abs(click["y"] - last_click["y"]) <= DOUBLE_CLICK_PIXEL_TOLERANCE
+    )
+    st.session_state._last_map_click = {"unix_time": click["unix_time"], "x": click["x"], "y": click["y"]}
+
+    if is_double_click:
+        # Zoom in on the point the first click of this pair already
+        # selected, rather than recomputing lat/lon from this click's
+        # pixel - the view may have already shifted after that first click.
+        st.session_state.zoom = min(MAX_ZOOM, st.session_state.zoom + 2)
+        return
+
+    center_x, center_y = lonlat_to_world_px(st.session_state.lon, st.session_state.lat, st.session_state.zoom)
+    top_left_x = center_x - MAP_WIDTH / 2
+    top_left_y = center_y - MAP_HEIGHT / 2
+    lat, lon = world_px_to_lonlat(top_left_x + click["x"], top_left_y + click["y"], st.session_state.zoom)
+    st.session_state.lat = lat
+    st.session_state.lon = lon
+
 
 # Output column order/names, matching the reference export layout
 OUTPUT_COLUMNS = ["Day", "Time", "GHI", "DNI", "DIF", "TEMP", "WS", "WD", "RH", "AP", "PWAT"]
@@ -126,52 +185,82 @@ email = st.text_input("Email Address", help="The email associated with your API 
 
 # --- Map & Coordinates Section ---
 st.markdown("### 2. Location")
-st.write("Search for a location using the magnifying glass icon on the map, or click anywhere to set the coordinates.")
+st.write("Search for a place, click the map, or type coordinates directly below.")
 
-# Initialize default coordinates (Denver, CO) in session state
 if "lat" not in st.session_state:
-    st.session_state.lat = 39.7410
+    st.session_state.lat = 38.199636821203164
 if "lon" not in st.session_state:
-    st.session_state.lon = -105.1702
+    st.session_state.lon = -7.498110901770388
 if "zoom" not in st.session_state:
-    st.session_state.zoom = 4
+    st.session_state.zoom = 10
 
-# Build the interactive Folium map
-m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=st.session_state.zoom)
-# Add a search bar to the map
-Geocoder().add_to(m)
-# Add a marker for the current selection
-folium.Marker([st.session_state.lat, st.session_state.lon], tooltip="Current Selection").add_to(m)
-# Let the search bar above also accept raw "lat, lon" coordinate input
-m.add_child(CoordinateSearch())
+# The map is a plain server-rendered image (stitched from map tiles), not an
+# embedded interactive JS map widget (e.g. streamlit_folium/Leaflet). That
+# earlier approach kept misbehaving - it only truly initializes once and
+# largely ignores further updates, making pan/zoom/click state fight against
+# Streamlit's rerun model. A static image + streamlit_image_coordinates'
+# native on_click callback (Streamlit's regular, well-tested widget-callback
+# protocol) avoids that entirely: every rerun renders a fresh image for the
+# current center/zoom, no client-side map state to keep in sync at all.
+def _search_place():
+    query = st.session_state.get("place_query")
+    if not query:
+        return
+    try:
+        geocode_response = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1},
+            headers={"User-Agent": "nsrdb-downloader-streamlit-app"},
+            timeout=10,
+        )
+        geocode_response.raise_for_status()
+        results = geocode_response.json()
+        if results:
+            st.session_state.lat = float(results[0]["lat"])
+            st.session_state.lon = float(results[0]["lon"])
+            st.session_state["_place_search_error"] = None
+        else:
+            st.session_state["_place_search_error"] = f"No results found for '{query}'."
+    except Exception as e:
+        st.session_state["_place_search_error"] = f"Place search failed: {e}"
 
-# Render the map in Streamlit (this catches map clicks automatically).
-# A stable key avoids remounting the map component on every rerun, and
-# limiting returned_objects means a Streamlit rerun only fires when the
-# click or zoom actually change, not on every pan/hover.
-map_data = st_folium(
-    m,
-    height=400,
-    width=700,
-    key="location_map",
-    returned_objects=["last_clicked", "zoom"],
-)
 
-# Update coordinates if the user clicked the map (or pasted coordinates into
-# the search bar, which is wired to fire a synthetic click - see CoordinateSearch)
-if map_data and map_data.get("last_clicked"):
-    st.session_state.lat = map_data["last_clicked"]["lat"]
-    st.session_state.lon = map_data["last_clicked"]["lng"]
+search_col, button_col = st.columns([4, 1])
+with search_col:
+    # on_change fires on Enter (or losing focus), so searching no longer
+    # requires pressing Enter *and then* clicking Search - either on its own
+    # triggers the same search.
+    st.text_input(
+        "Search for a place", key="place_query", placeholder="e.g. Vilnius, Lithuania",
+        label_visibility="collapsed", on_change=_search_place)
+with button_col:
+    st.button("Search", use_container_width=True, on_click=_search_place)
 
-# Preserve the current zoom level so the map doesn't reset on rerun
-if map_data and map_data.get("zoom"):
-    st.session_state.zoom = map_data["zoom"]
+if st.session_state.get("_place_search_error"):
+    st.warning(st.session_state["_place_search_error"])
+    st.session_state["_place_search_error"] = None
+
+zoom_out_col, zoom_in_col, _ = st.columns([1, 1, 4])
+with zoom_out_col:
+    if st.button("➖ Zoom out", use_container_width=True):
+        st.session_state.zoom = max(MIN_ZOOM, st.session_state.zoom - 1)
+with zoom_in_col:
+    if st.button("➕ Zoom in", use_container_width=True):
+        st.session_state.zoom = min(MAX_ZOOM, st.session_state.zoom + 1)
+
+map_image = render_map_image(
+    st.session_state.lat, st.session_state.lon, st.session_state.zoom, MAP_WIDTH, MAP_HEIGHT)
+streamlit_image_coordinates(
+    map_image, key="location_map_img", width=MAP_WIDTH, height=MAP_HEIGHT, on_click=_on_map_click)
+st.caption(
+    "Click the map to set the location, double-click to zoom in there (no mouse-wheel zoom - "
+    "use the buttons or double-click instead). Map tiles © CARTO, data © OpenStreetMap contributors.")
 
 col3, col4 = st.columns(2)
 with col3:
-    lat = st.number_input("Latitude", value=st.session_state.lat, format="%.4f")
+    lat = st.number_input("Latitude", key="lat", format="%.4f")
 with col4:
-    lon = st.number_input("Longitude", value=st.session_state.lon, format="%.4f")
+    lon = st.number_input("Longitude", key="lon", format="%.4f")
 
 # --- Settings Section ---
 st.markdown("### 3. Dataset Settings")
